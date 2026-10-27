@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# updatex — guided Fedora updates. Artwork: blyxyas/uwu-neofetch-art (CC0).
+# Создано sxxlxxr при участии GPT-6 Sol.
+set -u
+
+if ! command -v dnf >/dev/null || ! command -v rpm >/dev/null; then
+  echo 'updatex предназначен для Fedora с DNF.' >&2
+  exit 1
+fi
+
+portrait=$(cat <<'ART'
+⡆⣐⢕⢕⢕⢕⢕⢕⢕⠅⢗⢕⢕⢕⢕⢕⢕⢕⠕⠕⢕⢕⢕⢕⢕⢕⢕⢕⢕
+⢐⢕⢕⢕⢕⣕⢕⢕⠕⠁⢕⢕⢕⢕⢕⢕⢕⠅⡄⢕⢕⢕⢕⢕⢕⢕⢕⢕⢕
+⢕⢕⢕⢕⢕⠅⢗⢕⠕⣠⠄⣗⢕⢕⠕⢕⢕⢕⠕}⠐⢕⢕⢕⠑⢕⢕⠵⢕
+⢕⢕⢕⢕⠁⢜⠕⢁⣴⣿⡇⢓⢕⢵⢐⢕⢕⠕⢁⣾⢿⣧⠑⢕⢕⠄⢑⢕⠅⢕
+⢕⢕⠵⢁⠔⢁⣤⣤⣶⣶⣶⡐⣕⢽⠐⢕⠕⣡⣾⣶⣶⣶⣤⡁⢓⢕⠄⢑⢅⢑
+⠍⣧⠄⣶⣾⣿⣿⣿⣿⣿⣿⣷⣔⢕⢄⢡⣾⣿⣿⣿⣿⣿⣿⣿⣦⡑⢕⢤⠱⢐
+⢠⢕⠅⣾⣿⠋⢿⣿⣿⣿⠉⣿⣿⣷⣦⣶⣽⣿⣿⠈⣿⣿⣿⣿⠏⢹⣷⣷⡅⢐
+⣔⢕⢥⢻⣿⡀⠈⠛⠛⠁⢠⣿⣿⣿⣿⣿⣿⣿⣿⡀⠈⠛⠛⠁⠄⣼⣿⣿⡇⢔
+⢕⢕⢽⢸⢟⢟⢖⢖⢤⣶⡟⢻⣿⡿⠻⣿⣿⡟⢀⣿⣦⢤⢤⢔⢞⢿⢿⣿⠁⢕
+⢕⢕⠅⣐⢕⢕⢕⢕⣿⣿⡄⠛⢀⣦⠈⠛⢁⣼⣿⢗⢕⢕⢕⢕⢕⢕⡏⣘⢕
+⢕⢕⠅⢓⣕⣕⣕⣵⣿⣿⣿⣾⣿⣿⣿⣿⣿⣿⣿⣷⣕⢕⢕⢕⢕⡵⢀⢕⢕
+⢑⢕⠃⡈⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⢕⢕⢕
+⣆⢕⠄⢱⣄⠛⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢁⢕⢕⠕⢁
+⣿⣦⡀⣿⣿⣷⣶⣬⣍⣛⣛⣛⡛⠿⠿⠿⠛⠛⢛⣛⣉⣭⣤⣂⢜⠕⢑⣡⣴⣿
+ART
+)
+
+pause() {
+  if [[ -t 0 ]]; then
+    read -r -p $'\nНажми Enter, чтобы вернуться в меню...' _
+  fi
+}
+
+confirm() {
+  local reply
+  read -r -p "$1 [д/Н]: " reply || return 1
+  [[ "$reply" == [дДyY] ]]
+}
+
+choose() {
+  local title=$1 header=$2 selection
+  shift 2
+  if [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+    if [[ "$title" == Обновления ]] && (( $(tput lines 2>/dev/null || echo 0) >= 27 && $(tput cols 2>/dev/null || echo 0) >= 52 )); then
+      header="$portrait
+
+$header"
+    fi
+    selection=$(printf '%s\n' "$@" | fzf --no-sort --no-input --info=hidden \
+      --cycle --layout=reverse --height=~26 --border=rounded \
+      --border-label=" ✿ $title " --header-first --header="$header" \
+      --pointer='❯' --color='pointer:#f5a9c5,fg+:#f5a9c5,border:#b68abd' \
+      --footer='↑↓ выбрать  ·  Enter подтвердить  ·  Esc выйти') || return 1
+    CHOICE=${selection%% *}
+  else
+    printf '\n✿ %s\n%s\n\n' "$title" "$header"
+    printf '%s\n' "$@"
+    read -r -p 'Номер пункта: ' CHOICE || return 1
+  fi
+}
+
+kernel_versions() {
+  rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort -V
+}
+
+nvidia_installed() {
+  rpm -q akmod-nvidia >/dev/null 2>&1
+}
+
+# These packages affect graphics or the Steam/Proton environment. A cache rebuild
+# is possible, not guaranteed. A kernel module build is NOT shader compilation.
+shader_warning() {
+  local pkg
+  for pkg in "$@"; do
+    case "$pkg" in
+      akmod-nvidia|kmod-nvidia*|xorg-x11-drv-nvidia*|mesa*|vulkan*|steam|steam-*|proton*|dxvk*|vkd3d*|gamescope*|org.freedesktop.Platform.GL*|org.freedesktop.Platform.VAAPI.nvidia*|org.freedesktop.Platform.Vulkan*|com.valvesoftware.Steam*)
+        echo '⚠ Обновляется графика или Steam: некоторые игры могут заново собирать шейдеры.'
+        echo '  Это не то же самое, что сборка модуля NVIDIA для нового ядра.'
+        return ;;
+    esac
+  done
+  return 1
+}
+
+# KDE and core libraries are part of the system even if they ship .desktop files.
+is_core_package() {
+  case "$1" in
+    kernel*|akmod*|kmod*|mesa*|vulkan*|xorg-x11-drv-*|linux-firmware*|\
+    glibc*|systemd*|rpm*|dnf*|dracut*|grub*|shim*|plasma*|kwin*|\
+    kf6-*|kde-*|qt5-*|qt6-*|NetworkManager*|pipewire*|wireplumber*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+check_drivers() {
+  local running latest installed loaded ready=0
+  running=$(uname -r)
+  latest=$(kernel_versions | tail -n 1)
+  printf '\n🩺 Проверка драйверов · текущее ядро %s\n' "$running"
+
+  if nvidia_installed; then
+    installed=$(rpm -q akmod-nvidia --qf '%{VERSION}\n' 2>/dev/null)
+    if ! loaded=$(nvidia-smi --query-gpu=driver_version,name --format=csv,noheader 2>&1); then
+      echo "⚠ NVIDIA не работает в текущем сеансе: $loaded"
+      ready=1
+    else
+      echo "✓ NVIDIA видна: $loaded"
+      if [[ "${loaded%%,*}" != "$installed" ]]; then
+        echo "⚠ Загруженный драйвер отличается от установленного ($installed)."
+        echo '  После обновления драйвера это возможно до перезагрузки.'
+        ready=1
+      fi
+    fi
+    if ! modinfo -k "$running" nvidia >/dev/null 2>&1; then
+      echo "⚠ Модуль NVIDIA для текущего ядра $running не найден."
+      ready=1
+    fi
+  else
+    echo 'ℹ Пропускаю NVIDIA: пакет akmod-nvidia не установлен.'
+  fi
+
+  if command -v vulkaninfo >/dev/null 2>&1; then
+    if vulkaninfo --summary >/dev/null 2>&1; then
+      echo '✓ Vulkan отвечает.'
+    else
+      echo '⚠ Vulkan не отвечает; проверь графические драйверы.'
+      ready=1
+    fi
+  fi
+  if [[ -n "$latest" && "$running" != "$latest" ]]; then
+    echo "ℹ Установлено более новое ядро: $latest; после перезагрузки проверь драйвер снова."
+    ready=1
+  fi
+  return "$ready"
+}
+
+check_next_kernel() {
+  local target=$1 expected actual
+  [[ -n "$target" ]] || return 0
+  printf '\n🩺 Подготовка драйвера для ядра %s\n' "$target"
+  if ! nvidia_installed; then
+    echo 'ℹ NVIDIA не установлена; проверка модуля не нужна.'
+    return 0
+  fi
+  expected=$(rpm -q akmod-nvidia --qf '%{VERSION}\n' 2>/dev/null)
+  actual=$(modinfo -k "$target" -F version nvidia 2>/dev/null || true)
+  if [[ "$actual" != "$expected" ]]; then
+    echo '⏳ Ожидаю сборку модуля NVIDIA. Это может занять несколько минут...'
+    if ! sudo akmods --kernels "$target" --akmod nvidia; then
+      echo '⚠ Сборка модуля NVIDIA не удалась. Не перезагружайся, пока причина не выяснена.' >&2
+      return 1
+    fi
+    actual=$(modinfo -k "$target" -F version nvidia 2>/dev/null || true)
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    echo "⚠ NVIDIA для $target не готова (ожидалась $expected, найдена ${actual:-отсутствует})." >&2
+    echo '  Не перезагружайся, пока причина не выяснена.' >&2
+    return 1
+  fi
+  echo "✓ Модуль NVIDIA $actual для $target готов."
+  echo 'ℹ Окончательно проверить драйвер можно только после загрузки нового ядра.'
+}
+
+offer_kernel_cleanup() {
+  local -a versions
+  local running latest previous oldest
+  mapfile -t versions < <(kernel_versions)
+  (( ${#versions[@]} >= 3 )) || return 0
+  running=$(uname -r)
+  latest=${versions[${#versions[@]}-1]}
+  previous=${versions[${#versions[@]}-2]}
+  oldest=${versions[0]}
+  if [[ "$running" != "$latest" ]]; then
+    echo 'ℹ Старые ядра не трогаю: система загружена не с самого нового ядра.'
+    return 0
+  fi
+  if ! check_drivers; then
+    echo '⚠ Драйверы не прошли проверку. Удаление старого ядра не предлагаю.'
+    return 0
+  fi
+  printf '\nУстановлено ядер: %s.\n' "${#versions[@]}"
+  echo "Текущее:    $running"
+  echo "Резервное:  $previous"
+  echo "Самое старое: $oldest"
+  echo 'DNF покажет полный список удаляемых пакетов и отдельно попросит подтверждение.'
+  if confirm "Предложить DNF удалить только ядро $oldest?"; then
+    sudo dnf remove "kernel-core-$oldest"
+  fi
+}
+
+check_updates() {
+  local mode=${1:-all} rpm_raw user_raw system_raw name file owner ref app_id
+  local -a rpm_updates=() apps=() system=() user_flats=() system_flats=()
+  local -A desktop_packages=() flatpak_apps=()
+
+  if [[ "$mode" == flatpak ]]; then
+    printf '\n🔎 Проверяю только Flatpak...\n'
+  else
+    printf '\n🔎 Проверяю DNF и Flatpak...\n'
+    if ! rpm_raw=$(dnf --quiet --assumeno --refresh repoquery --upgrades --qf '%{name}\n' </dev/null 2>&1); then
+      printf 'Ошибка проверки DNF:\n%s\n' "$rpm_raw" >&2
+      return 1
+    fi
+    if [[ -n "$rpm_raw" ]]; then
+      mapfile -t rpm_updates < <(printf '%s\n' "$rpm_raw" | LC_ALL=C sort -u)
+    fi
+
+    # Approximation: desktop launchers identify RPM applications; show the result
+    # before proceeding. DNF still shows and confirms the actual transaction.
+    while IFS= read -r -d '' file; do
+      owner=$(rpm -qf --qf '%{NAME}\n' "$file" 2>/dev/null) || continue
+      desktop_packages["$owner"]=1
+    done < <(find /usr/share/applications -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+    for name in "${rpm_updates[@]}"; do
+      if [[ -v desktop_packages["$name"] ]] && ! is_core_package "$name"; then
+        apps+=("$name")
+      else
+        system+=("$name")
+      fi
+    done
+  fi
+
+  if command -v flatpak >/dev/null 2>&1; then
+    if ! user_raw=$(flatpak remote-ls --user --updates --columns=application,branch,arch 2>&1); then
+      printf 'Ошибка проверки пользовательских Flatpak:\n%s\n' "$user_raw" >&2
+      return 1
+    fi
+    if ! system_raw=$(flatpak remote-ls --system --updates --columns=application,branch,arch 2>&1); then
+      printf 'Ошибка проверки системных Flatpak:\n%s\n' "$system_raw" >&2
+      return 1
+    fi
+    [[ -z "$user_raw" ]] || mapfile -t user_flats < <(printf '%s\n' "$user_raw" | LC_ALL=C sort -u)
+    [[ -z "$system_raw" ]] || mapfile -t system_flats < <(printf '%s\n' "$system_raw" | LC_ALL=C sort -u)
+    while IFS= read -r app_id; do
+      [[ -z "$app_id" ]] || flatpak_apps["$app_id"]=1
+    done < <(flatpak list --app --user --columns=application 2>/dev/null)
+    while IFS= read -r app_id; do
+      [[ -z "$app_id" ]] || flatpak_apps["$app_id"]=1
+    done < <(flatpak list --app --system --columns=application 2>/dev/null)
+  fi
+
+  RPM_UPDATES=("${rpm_updates[@]}")
+  APP_UPDATES=("${apps[@]}")
+  SYSTEM_UPDATES=("${system[@]}")
+  USER_FLATS=("${user_flats[@]}")
+  SYSTEM_FLATS=("${system_flats[@]}")
+  FLAT_APP_REFS=()
+  FLAT_RUNTIME_REFS=()
+  for ref in "${user_flats[@]}" "${system_flats[@]}"; do
+    app_id=${ref%%$'\t'*}
+    if [[ -v flatpak_apps["$app_id"] ]]; then
+      FLAT_APP_REFS+=("$app_id")
+    else
+      FLAT_RUNTIME_REFS+=("$app_id")
+    fi
+  done
+}
+
+summary() {
+  local mode=$1 rpm_count=0 flat_count=0 ref
+  local -a graphics_candidates=()
+  case "$mode" in
+    all) rpm_count=${#RPM_UPDATES[@]}; flat_count=$(( ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} )) ;;
+    system) rpm_count=${#SYSTEM_UPDATES[@]} ;;
+    apps) rpm_count=${#APP_UPDATES[@]}; flat_count=$(( ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} )) ;;
+    flatpak) flat_count=$(( ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} )) ;;
+  esac
+  printf 'Найдено для выбранного режима:\n'
+  if [[ "$mode" != flatpak ]]; then
+    printf '  🖥 RPM-пакеты: %s' "$rpm_count"
+    [[ "$mode" == system ]] && printf ' (без распознанных приложений)'
+    [[ "$mode" == apps ]] && printf ' (распознанные приложения)'
+    printf '\n'
+  fi
+  if [[ "$mode" != system ]]; then
+    printf '  📦 Flatpak: %s · приложения: %s · компоненты: %s\n' \
+      "$flat_count" "${#FLAT_APP_REFS[@]}" "${#FLAT_RUNTIME_REFS[@]}"
+  fi
+  [[ "$mode" == all || "$mode" == system ]] && graphics_candidates+=("${SYSTEM_UPDATES[@]}")
+  [[ "$mode" == all || "$mode" == apps ]] && graphics_candidates+=("${APP_UPDATES[@]}")
+  if [[ "$mode" != system ]]; then
+    for ref in "${USER_FLATS[@]}" "${SYSTEM_FLATS[@]}"; do
+      graphics_candidates+=("${ref%%$'\t'*}")
+    done
+  fi
+  shader_warning "${graphics_candidates[@]}" || true
+  if [[ "$mode" != flatpak ]]; then
+    echo 'ℹ Деление RPM приблизительное: DNF покажет зависимости перед установкой.'
+  fi
+}
+
+show_details() {
+  local mode=$1 ref
+  {
+    if [[ "$mode" == all || "$mode" == system ]]; then
+      printf '\nRPM-пакеты (без распознанных приложений):\n'
+      printf '  %s\n' "${SYSTEM_UPDATES[@]}"
+    fi
+    if [[ "$mode" == all || "$mode" == apps ]]; then
+      printf '\nRPM-приложения:\n'
+      printf '  %s\n' "${APP_UPDATES[@]}"
+    fi
+    if [[ "$mode" != system ]]; then
+      printf '\nFlatpak пользователя (приложения и компоненты):\n'
+      for ref in "${USER_FLATS[@]}"; do printf '  %s\n' "${ref//$'\t'/ · }"; done
+      printf '\nFlatpak системы (приложения и компоненты):\n'
+      for ref in "${SYSTEM_FLATS[@]}"; do printf '  %s\n' "${ref//$'\t'/ · }"; done
+    fi
+  } | { if [[ -t 0 && -t 1 ]] && command -v less >/dev/null 2>&1; then less -FRX; else cat; fi; }
+}
+
+review_updates() {
+  local mode=$1 title
+  while true; do
+    if [[ "$mode" == check ]]; then
+      choose 'Проверка обновлений' "$(summary all)" \
+        '1  📋 Показать подробный список' \
+        '2  ↩ Вернуться в меню' || return 1
+      case "$CHOICE" in
+        1) show_details all ;;
+        2) return 0 ;;
+      esac
+    else
+      case "$mode" in
+        all) title='Обновить всё' ;;
+        system) title='Обновить RPM без приложений' ;;
+        apps) title='Обновить программы' ;;
+        flatpak) title='Обновить только Flatpak' ;;
+      esac
+      choose "$title" "$(summary "$mode")" \
+        '1  📋 Показать подробный список' \
+        '2  ✓ Продолжить к подтверждению установки' \
+        '3  ↩ Отмена' || return 1
+      case "$CHOICE" in
+        1) show_details "$mode" ;;
+        2) return 0 ;;
+        3) return 1 ;;
+      esac
+    fi
+  done
+}
+
+run_update() {
+  local mode=$1 before after dnf_ok=1 flat_ok=1 excluded
+  local -a args=()
+  check_updates "$mode" || return 1
+  if [[ "$mode" == system ]]; then
+    if (( ${#SYSTEM_UPDATES[@]} == 0 )); then
+      echo 'Нет системных RPM-обновлений.'
+      return 0
+    fi
+  elif [[ "$mode" == apps ]]; then
+    if (( ${#APP_UPDATES[@]} + ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} == 0 )); then
+      echo 'Нет обновлений программ.'
+      return 0
+    fi
+  elif [[ "$mode" == flatpak ]]; then
+    if (( ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} == 0 )); then
+      echo 'Нет обновлений Flatpak.'
+      return 0
+    fi
+  elif (( ${#RPM_UPDATES[@]} + ${#USER_FLATS[@]} + ${#SYSTEM_FLATS[@]} == 0 )); then
+    echo 'Обновлений нет.'
+    return 0
+  fi
+
+  review_updates "$mode" || { echo 'Отменено.'; return 0; }
+  if [[ "$mode" != flatpak ]]; then
+    printf '\n⚠ DNF может добавить необходимые зависимости. Перед установкой он покажет их список.\n'
+  fi
+  confirm 'Начать выбранное обновление?' || { echo 'Отменено.'; return 0; }
+  before=$(kernel_versions | tail -n 1)
+
+  if [[ "$mode" == apps && ${#APP_UPDATES[@]} -gt 0 ]]; then
+    args=("${APP_UPDATES[@]}")
+  elif [[ "$mode" == system && ${#SYSTEM_UPDATES[@]} -gt 0 ]]; then
+    if (( ${#APP_UPDATES[@]} > 0 )); then
+      excluded=$(IFS=,; echo "${APP_UPDATES[*]}")
+      args=("--exclude=$excluded")
+    fi
+  fi
+
+  if [[ "$mode" == all ]] || (( ${#args[@]} > 0 )) || [[ "$mode" == system ]]; then
+    printf '\n🖥 Обновляю RPM. DNF ещё раз попросит подтверждение транзакции.\n'
+    if ! sudo dnf upgrade --refresh "${args[@]}"; then
+      echo '⚠ Обновление DNF не завершилось. Проверь вывод выше.' >&2
+      dnf_ok=0
+    fi
+  fi
+
+  if [[ "$mode" != system ]]; then
+    if (( ${#USER_FLATS[@]} > 0 )); then
+      printf '\n📦 Обновляю пользовательские Flatpak...\n'
+      flatpak update --user || flat_ok=0
+    fi
+    if (( ${#SYSTEM_FLATS[@]} > 0 )); then
+      printf '\n📦 Обновляю системные Flatpak...\n'
+      flatpak update --system || flat_ok=0
+    fi
+  fi
+
+  after=$(kernel_versions | tail -n 1)
+  if [[ "$mode" != flatpak && "$dnf_ok" == 1 && -n "$after" ]] && nvidia_installed; then
+    # Also covers an NVIDIA driver update without a kernel update.
+    if ! check_next_kernel "$after"; then
+      echo '⚠ Проверь драйвер перед перезагрузкой.' >&2
+      return 1
+    fi
+  fi
+  if [[ "$dnf_ok" == 0 || "$flat_ok" == 0 ]]; then
+    echo '⚠ Не все обновления завершились. Проверь ошибки выше.' >&2
+    return 1
+  fi
+  printf '\n✓ Выбранные обновления завершены.\n'
+  if [[ "$before" != "$after" ]]; then
+    echo "ℹ Появилось новое ядро: $after. После перезагрузки запусти updatex и проверь драйверы."
+    echo '  До первой успешной загрузки нового ядра старые ядра не удаляю.'
+  elif nvidia_installed; then
+    echo 'ℹ Если обновился драйвер NVIDIA, для его загрузки может понадобиться перезагрузка.'
+  fi
+}
+
+if [[ "${1:-}" == --check-after-reboot ]]; then
+  if check_drivers; then
+    offer_kernel_cleanup
+  fi
+  exit 0
+fi
+if (( $# > 0 )); then
+  echo 'Использование: updatex [--check-after-reboot]' >&2
+  exit 2
+fi
+
+while true; do
+  header="Fedora · ядро $(uname -r)"
+  if nvidia_installed; then header="$header · NVIDIA"; fi
+  choose 'Обновления' "$header" \
+    '1  🔎 Проверить обновления' \
+    '2  ✨ Обновить всё' \
+    '3  🖥  Только систему (RPM без найденных приложений)' \
+    '4  🎮 Только программы (RPM-приложения и Flatpak)' \
+    '5  📦 Только Flatpak' \
+    '6  🩺 Проверить драйверы и старые ядра' \
+    '7  🚪 Выход' || exit 0
+  case "$CHOICE" in
+    1) if check_updates; then review_updates check; fi; pause ;;
+    2) run_update all; pause ;;
+    3) run_update system; pause ;;
+    4) run_update apps; pause ;;
+    5) run_update flatpak; pause ;;
+    6) if check_drivers; then offer_kernel_cleanup; fi; pause ;;
+    7) exit 0 ;;
+    *) echo 'Неизвестный пункт.'; pause ;;
+  esac
+done
